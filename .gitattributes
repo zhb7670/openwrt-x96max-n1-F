@@ -1,0 +1,27 @@
+# 统一行尾为 LF。
+#
+# 为什么必须钉死：
+#   openwrt_flippy.sh 是给 Linux runner 执行的 bash 脚本，
+#   一旦被转成 CRLF，CI 上会立刻报
+#     /usr/bin/env: 'bash\r': No such file or directory
+#   或   bad interpreter: /usr/bin/env bash^M
+#   然后整个打包直接挂掉。
+#
+#   action.yml / *.yml 同理（GitHub Actions 解析器对 CRLF 也敏感）。
+
+* text=auto eol=lf
+*.sh       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.md       text eol=lf
+LICENSE    text eol=lf
+.gitignore text eol=lf
+
+# 二进制文件不要动
+*.gz   binary
+*.img  binary
+*.xz   binary
+*.zst  binary
+*.zip  binary
+*.png  binary
+*.jpg  binary
