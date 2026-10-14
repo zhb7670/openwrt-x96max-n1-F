@@ -20,7 +20,77 @@ V2 **不是重打一遍 V1**。它是在 V1 完全相同的打包流程上，**�
   - `createindex()` 只扫 `/usr/lib/lua/luci/controller/*.lua`，**根本不读 `menu.d/`**
   - `dispatcher.lua` **没有 `view()` 函数**，撑不起新架构的视图加载
   → 所以官方菜单在**这套固件上天生不会出现**，不是装错包，是架构不兼容。
+
+  **实测证据（对 ophub rootfs 解包核对）**：
+
+  | 检查项 | 实测结果 | 含义 |
+  |---|---|---|
+  | `luci-base` 版本 | `git-26.034.10143-64f3163-1` | 老式 lua 架构的 LuCI |
+  | `dispatcher.lua` 行数 | 946 | — |
+  | grep `function view` | **0 次** | 确认**没有** `view()`，撑不起 `"type": "view"` |
+  | grep `menu.d` | **0 次** | 确认**根本不读** `menu.d` |
+  | grep `function template` | 1 次 | 老式写法可用 ✅ |
+  | grep `function alias` | 1 次 | 老式写法可用 ✅ |
+  | 整个 rootfs 的 `menu.d/*.json` | **只有 1 个** | 就是 `luci-app-ddns-go.json` 自己 |
+
+  而官方那个 `luci-app-ddns-go.json` 里写的 action 是：
+
+  ```json
+  "admin/services/ddns-go":            { "order": 58, "action": { "type": "firstchild" } }
+  "admin/services/ddns-go/ddns-go":    { "order": 10, "action": { "type": "view", "path": "ddns-go/ddns-go" } }
+  "admin/services/ddns-go/config":     { "order": 20, "action": { "type": "view", "path": "ddns-go/config" } }
+  "admin/services/ddns-go/log":        { "order": 30, "action": { "type": "view", "path": "ddns-go/log" } }
+  ```
+
+  `firstchild` 和 `view` 这两种 action 本固件**都不支持**（`dispatcher.lua` 里只有
+  `template` / `cbi` / `form` / `arcombine`），所以即便读到了 menu.d 也渲染不出来。
+
+  **源码级铁证** —— `dispatcher.lua` 第 500 行起 `createindex()` 的实现：
+
+  ```lua
+  function createindex()
+      local controllers = { }
+      local base = "%s/controller/" % util.libpath()
+      local _, path
+
+      for path in (fs.glob("%s*.lua" % base) or function() end) do
+          controllers[#controllers+1] = path          -- 只扫 controller/*.lua
+      end
+
+      for path in (fs.glob("%s*/*.lua" % base) or function() end) do
+          controllers[#controllers+1] = path          -- 只扫 controller/*/*.lua
+      end
+      -- ……中间是索引缓存的 mtime 校验……
+      for _, path in ipairs(controllers) do
+          local modname = "luci.controller." .. path:sub(#base+1, #path-4):gsub("/", ".")
+          local mod = require(modname)
+          assert(mod ~= true,
+                 "Invalid controller file found\n" ..
+                 "The file '" .. path .. "' contains an invalid module line.\n" ..
+                 "Please verify whether the module name is set to '" .. modname ..
+                 "' - It must correspond to the file path!")
+          local idx = mod.index
+          assert(type(idx) == "function", "……contains no index() function……")
+          index[modname] = idx
+      end
+      -- ……
+  end
+  ```
+
+  三条都能一一对上：
+
+  | 源码位置 | 说明 |
+  |---|---|
+  | `base = "%s/controller/"` + 两个 `fs.glob("*lua")` | **扫描范围只有 controller 目录**，全程不出现 menu.d → 官方菜单不可能被索引到 |
+  | `modname = "luci.controller." .. 文件名` | 模块名**由文件名反推**，所以文件名必须与 `module()` 名严格一致 |
+  | `assert(mod ~= true, "Invalid controller file found…")` | 名字不一致时 `require` 会返回 `true`（loader 无返回值），**assert 立即抛异常 → 整个 LuCI 500**。官方注释原文写着 "It must correspond to the file path!" |
+
+  顺带确认：`createindex()` 里的**索引缓存是有 mtime 校验的**（拿 controller 文件的
+  mtime 跟缓存文件比），所以 `/tmp/luci-indexcache` 会随 controller 更新自动失效；
+  真正会"改了不生效"的是**第二层** `/tmp/luci-modulecache`（`ccache.lua` 无时间戳校验）。
+
 - **解决**：用老式写法补一份 controller + view（`luci.controller.ddns-go` + `template`）。
+  排序沿用官方 menu.d 里的 **58**，保证菜单落点和官方意图一致。
 - **★ 踩过的坑（必须写下来）**：controller 的**文件名必须与 `module()` 名严格一致**
   （`ddns-go.lua` ↔ `luci.controller.ddns-go`）。名字对不上时 `createindex()` 会断言失败，
   后果是 **整个 LuCI 全站 500**，不只是这一个菜单坏掉。
@@ -74,24 +144,81 @@ V2 **不是重打一遍 V1**。它是在 V1 完全相同的打包流程上，**�
 
 ---
 
-### 二·补、适用前提（请先读这一条）
+### 二·补、适用前提（已实测确认）
 
-V2 修的是 **DDNS-GO 已经装好、但菜单不出现 / 服务不启动** 这两个问题。
+**先说结论：本版用的 ophub rootfs 里已经自带完整的 ddns-go 后端，无需另装。**
 
-**它不负责安装 ddns-go 后端本身。** 判断方法：
+对 `2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz` 解包核对，以下文件都在：
 
-```bash
-ls -l /usr/bin/ddns-go /etc/init.d/ddns-go /etc/config/ddns-go
+```
+/usr/bin/ddns-go                      ← 主程序
+/etc/init.d/ddns-go                   ← procd 服务脚本
+/etc/config/ddns-go                   ← 出厂配置（问题就在这）
+/etc/rc.d/S99ddns-go                  ← 开机自启软链，已存在
+/etc/uci-defaults/luci-ddns-go        ← 官方自己的首启脚本
+/usr/share/ddns-go/ddns-go-default.yaml
+/lib/upgrade/keep.d/ddns-go            ← 升级时保留配置
+/usr/libexec/ddns-go-call
 ```
 
-| 情况 | 结果 |
-|---|---|
-| 三个文件都在 | 刷完 V2 **开箱即用**：菜单出现、服务已启动、9876 在听 |
-| 只有 `/etc/config/ddns-go`，没有 `init.d`/二进制 | 菜单会出现，服务不启动（缺后端） |
-| 三个都没有 | 菜单文件已就位，但页面内嵌的 9876 打不开；首启自修脚本**主动跳过，不动系统**。等你装好 ddns-go 后，菜单立即可用 |
+所以刷完 V2 就是**开箱即用**。
 
-也就是说：**即使当前的 rootfs 默认包集里没有 ddns-go，装 V2 也没有任何副作用**——
-菜单文件是静态落盘的，自修脚本有守卫会自己让路。装完 ddns-go 后再手动确认一次即可：
+#### ★ 铁证：出厂配置就是 `enabled '0'`
+
+解包出来的 `/etc/config/ddns-go` 原文：
+
+```uci
+config basic 'config'
+        option enabled '0'          ← ★ 病根
+        option logger '1'
+        option port '9876'
+        option time '300'
+        option ctimes '5'
+        option skipverify '0'
+        option delay '0'
+        option dns '223.5.5.5'
+```
+
+对应的 `/etc/init.d/ddns-go` 第 56–58 行：
+
+```sh
+config_get_bool enabled $cfg enabled 1
+[[ x$enabled = x1 ]] || return 1     ← enabled=0 就在这里 return 掉了
+```
+
+（段名是 `config`，段类型是 `basic`，所以 UCI 键写作 `ddns-go.config.enabled`。）
+
+#### ★★ 最耐人寻味的一条：官方脚本漏了改 `enabled`
+
+官方自带的 `/etc/uci-defaults/luci-ddns-go` 原文：
+
+```sh
+#!/bin/sh
+[ -s "/etc/ddns-go/localtime" ] && mv -f /etc/ddns-go/localtime /etc/localtime
+/etc/init.d/ddns-go enable
+/etc/init.d/ddns-go start        ← 这一句其实是白做的
+rm -f /tmp/luci*
+exit 0
+```
+
+官方**确实**调了 `enable` 和 `start`，但**始终没有把 UCI 里的 `enabled` 改成 1**。
+于是 `start` 被上面那行 `|| return 1` 拦下，结果就是：
+
+- `enable` 生效 → `/etc/rc.d/S99ddns-go` 软链存在，看起来"已启用"
+- `start` 无效 → 进程没起，`active with no instances`，9876 不监听
+
+**官方漏掉的这一步，正是 V2 补上的那一步。** 我们的 `99-ddns-go-fix` 先执行
+（`9` 的字典序在 `l` 之前），把 `enabled` 置 1 再 `restart`；
+之后官方的 `luci-ddns-go` 再跑一遍 `enable`/`start` 也变成有效调用。
+两种执行顺序都能起来，互为兜底。
+
+另外注意：官方脚本里也有 `rm -f /tmp/luci*` —— 说明清 LuCI 缓存这件事官方自己也认为是必需的。
+
+#### 万一将来换个 rootfs（没有 ddns-go）
+
+那也不用担心。我们的自修脚本第 0 步有守卫：检测不到 `/etc/config/ddns-go`
+和 `/etc/init.d/ddns-go` 时**直接退出，不改系统**；菜单文件仍然静态落盘，
+等你装好 ddns-go 后再执行一次下面这条即可：
 
 ```bash
 uci set ddns-go.config.enabled='1' && uci commit ddns-go && /etc/init.d/ddns-go restart
