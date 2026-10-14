@@ -1,0 +1,32 @@
+<%#
+ DDNS-GO 面板（V2 定制）
+ 直接内嵌 ddns-go 自带的 Web UI（监听 9876）。
+
+ 说明：
+   ddns-go 的 Web UI 默认 notallowwanaccess: true，只允许内网访问。
+   这里的 iframe 走的是当前 LuCI 的主机名（即 LAN IP），所以能正常加载。
+   万一 iframe 被浏览器策略挡了，下面有「新窗口打开」兜底按钮。
+-%>
+<%+header%>
+
+<%
+	local host = luci.http.getenv("HTTP_HOST") or "192.168.1.1"
+	host = host:gsub(":%d+$", "")
+	local url = "http://" .. host .. ":9876/"
+%>
+
+<h2 name="content"><%:DDNS-GO %></h2>
+
+<div class="cbi-section">
+	<p class="cbi-section-descr">
+		<%:Below is the built-in web UI of ddns-go running on port 9876. %><%:If it does not load, open it in a new window. %>
+	</p>
+	<p>
+		<a class="cbi-button cbi-button-apply" href="<%=url%>" target="_blank" rel="noopener"><%:Open in a new window %></a>
+	</p>
+	<iframe src="<%=url%>"
+		style="width:100%;height:78vh;min-height:560px;border:1px solid #d5d5d5;border-radius:6px;background:#fff;"
+		referrerpolicy="no-referrer-when-downgrade"></iframe>
+</div>
+
+<%+footer%>

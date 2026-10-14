@@ -51,9 +51,13 @@ on:
         required: false
         default: "2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
       release_tag:
-        description: "发布到哪个 Release tag"
+        description: "发布到哪个 Release tag（V1 = 纯官方 / V2 = 官方 + DDNS-GO 修复）"
         required: true
-        default: "N1-X96MaxPlus"
+        default: "V1"
+      inject_dir:
+        description: "要注入的定制目录（留空 = 不注入 = 纯 ophub 官方产物，即 V1）"
+        required: false
+        default: ""
 
 env:
   TZ: Etc/UTC
@@ -168,13 +172,74 @@ jobs:
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       #------------------------------------------------------------------
+      # 3.5 注入定制 overlay —— ★ 只有 V2 会走到这里
+      #
+      #     设计原则：inject_dir 留空 => 整步直接跳过 => 产出与 V1 逐字节
+      #     行为一致（零回退）。V2 的定制内容全部隔离在 v2-inject/ 目录，
+      #     V1 构建永远不会读它。
+      #
+      #     做法：解包官方 rootfs -> 叠加 overlay -> 用同一个文件名重新打包。
+      #     文件名不能变，因为 openwrt_flippy.sh 只认
+      #     opt/download/openwrt-armsr-armv8-generic-rootfs.tar.gz。
+      #------------------------------------------------------------------
+      - name: 注入定制 overlay
+        id: inject
+        if: steps.download.outputs.status == 'success'
+        working-directory: /builder
+        run: |
+          set -e
+          INJECT="${{ inputs.inject_dir }}"
+          if [ -z "${INJECT}" ]; then
+            echo ">>> 未指定 inject_dir —— 跳过注入，本次产出等同纯 ophub 官方（即 V1）"
+            echo "status=success" >> ${GITHUB_OUTPUT}
+            exit 0
+          fi
+
+          SRC="${GITHUB_WORKSPACE}/${INJECT}/overlay"
+          if [ ! -d "${SRC}" ]; then
+            echo ">>> 注入目录不存在：${SRC}"
+            exit 1
+          fi
+
+          ROOTFS="opt/download/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          WORK=/builder/inject-work
+          sudo rm -rf "${WORK}" && sudo mkdir -p "${WORK}"
+
+          echo ">>> 解包官方 rootfs ..."
+          sudo tar -xzf "${ROOTFS}" -C "${WORK}" -p
+
+          echo ">>> 叠加定制文件：${INJECT}/overlay"
+          echo "---------------- 注入清单 ----------------"
+          ( cd "${SRC}" && find . -type f -printf '%M %8s  %p\n' | sort )
+          echo "------------------------------------------"
+          sudo cp -a "${SRC}/." "${WORK}/"
+
+          # uci-defaults 脚本必须可执行；git 检出后是小写 644
+          if [ -d "${WORK}/etc/uci-defaults" ]; then
+            sudo find "${WORK}/etc/uci-defaults" -maxdepth 1 -type f ! -perm -u+x \
+              -exec chmod 755 {} + 2>/dev/null || true
+          fi
+
+          echo ">>> 重新打包（保持原文件名）"
+          sudo rm -f "${ROOTFS}"
+          ( cd "${WORK}" && sudo tar -cpf - . ) | pigz -9 > "${ROOTFS}.new"
+          mv "${ROOTFS}.new" "${ROOTFS}"
+          ls -l --block-size=1 "${ROOTFS}"
+          echo ">>> 归档自检：条目数 $(tar -tzf "${ROOTFS}" | wc -l)"
+
+          echo ">>> 关键文件落位确认："
+          tar -tzf "${ROOTFS}" | grep -E 'ddns-go' || echo "    [warn] 未在归档中找到 ddns-go 相关条目"
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      #------------------------------------------------------------------
       # 4. 打包：直接调用本仓库根目录的 action（= ophub 的 openwrt_flippy.sh）
       #    OPENWRT_ARMSR 是相对 $GITHUB_WORKSPACE 的路径，脚本内部会复制到
       #    /opt/openwrt_packit/ 并改名为标准文件名
       #------------------------------------------------------------------
       - name: 打包固件
         uses: ./
-        if: steps.download.outputs.status == 'success'
+        if: steps.inject.outputs.status == 'success'
         env:
           OPENWRT_ARMSR: opt/download/*rootfs.tar.gz
           PACKAGE_SOC: ${{ inputs.package_soc }}
@@ -219,34 +284,39 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      #------------------------------------------------------------------
+      # 6. 生成 Release 说明
+      #    版本说明按 tag 从 docs/ 下取，V1 与 V2 各存各的文件，互不覆盖
+      #------------------------------------------------------------------
+      - name: 生成 Release 说明
+        id: body
+        if: always()
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          case "${TAG}" in
+            V2|v2|V2-*|v2-*)
+              DOC="docs/RELEASE_V2.md"
+              NAME="V2 - 官方流程 + DDNS-GO 修复" ;;
+            *)
+              DOC="docs/RELEASE_V1.md"
+              NAME="V1 - 纯 ophub 官方流程固件" ;;
+          esac
+          if [ -f "${DOC}" ]; then
+            cp "${DOC}" /tmp/release-body.md
+            echo ">>> 使用版本说明：${DOC}"
+          else
+            printf '## OpenWrt 固件（Phicomm N1 / X96Max+）\n\n由 ophub 标准流程打包。\n' > /tmp/release-body.md
+            echo ">>> 未找到 ${DOC}，使用兜底说明"
+          fi
+          echo "bodyfile=${DOC}"       >> ${GITHUB_OUTPUT}
+          echo "releasename=${NAME}"   >> ${GITHUB_OUTPUT}
+
       - name: 发布到 Release
         if: env.PACKAGED_STATUS == 'success'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
-          name: ${{ inputs.release_tag }}
+          name: ${{ steps.body.outputs.releasename || inputs.release_tag }}
           files: ${{ env.PACKAGED_OUTPUTPATH }}/*
           make_latest: true
-          body: |
-            ## OpenWrt 固件（Phicomm N1 / X96Max+）
-
-            由 [ophub/flippy-openwrt-actions](https://github.com/ophub/flippy-openwrt-actions)
-            标准流程打包（`unifreq/openwrt_packit` + `ophub/kernel`）。
-
-            | 机型 | 内核 | 文件 |
-            |---|---|---|
-            | Phicomm N1 (S905D) | 6.12.112 | `openwrt_s905d_n1_R26.03.25_k6.12.112-flippy-95+o.img.gz` |
-            | Phicomm N1 (S905D) | 6.18.56 | `openwrt_s905d_n1_R26.03.25_k6.18.56-flippy-95+.img.gz` |
-            | X96Max+ (S905X3) | 6.12.112 | `openwrt_s905x3_multi_R26.03.25_k6.12.112-flippy-95+o.img.gz` |
-            | X96Max+ (S905X3) | 6.18.56 | `openwrt_s905x3_multi_R26.03.25_k6.18.56-flippy-95+.img.gz` |
-
-            - 默认 IP：**192.168.1.1**
-            - 用户名 `root`　密码 `password`
-            - 默认 WIFI：`OpenWrt`　密码：无
-            - 写入 eMMC：登录 → 系统 → Amlogic Service → Install OpenWrt
-
-            校验下载完整性：
-
-            ```bash
-            sha256sum -c sha256sums.txt
-            ```
+          body_path: /tmp/release-body.md

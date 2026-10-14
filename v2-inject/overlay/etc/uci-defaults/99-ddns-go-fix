@@ -1,0 +1,46 @@
+#!/bin/sh
+#===========================================================================
+#  V2 定制：DDNS-GO 首次开机自修
+#
+#  放在 /etc/uci-defaults/ 下 —— OpenWrt 约定：系统首次启动时执行一次，
+#  执行成功后脚本会被自动删除，所以不会重复跑。
+#
+#  修的是什么：
+#    固件里 /etc/config/ddns-go 默认是这样：
+#        config basic 'config'
+#            option enabled '0'          ← 问题在这
+#    而 /etc/init.d/ddns-go 里有：
+#        config_get_bool enabled $cfg enabled 1
+#        [ "$enabled" = "1" ] || return 1     ← enabled=0 直接 return
+#    结果：实例根本不创建 → 服务显示 "active with no instances"，
+#          9876 端口不监听，ddns-go 自带 Web UI 打不开。
+#
+#    ★ 注意配置段名是 basic（config basic 'config'），
+#      所以 UCI 键是 ddns-go.config.enabled，不是 ddns-go.basic.enabled。
+#
+#   ★ V2 只负责「修」，不负责「装」：如果固件里根本没有 ddns-go 后端，
+#      本脚本直接退出，不会凭空造出一个只有 enabled 的 /etc/config/ddns-go。
+#      菜单部分（controller + view）是打包时落盘的静态文件，不受影响。
+#===========================================================================
+
+# 0) 守卫：后端不存在就什么都不做
+if [ ! -f /etc/config/ddns-go ] && [ ! -x /etc/init.d/ddns-go ]; then
+	exit 0
+fi
+
+# 1) 打开 enabled 开关
+uci -q set ddns-go.config.enabled='1' 2>/dev/null
+uci -q commit ddns-go 2>/dev/null
+
+# 2) 设开机自启 + 立刻起来
+if [ -x /etc/init.d/ddns-go ]; then
+	/etc/init.d/ddns-go enable 2>/dev/null
+	/etc/init.d/ddns-go restart 2>/dev/null
+fi
+
+# 3) 清 LuCI 双层缓存
+#    第二层 /tmp/luci-modulecache 在 ccache.lua 里没有任何时间戳校验，
+#    命中就永久返回旧字节码 —— 不清的话新菜单不会出现。
+rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null
+
+exit 0
