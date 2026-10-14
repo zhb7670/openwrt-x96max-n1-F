@@ -199,8 +199,11 @@ jobs:
             echo "---------------- 产物清单 ----------------"
             ls -l --block-size=1
             echo "---------------- sha256 ------------------"
-            sha256sum *.img.gz > sha256sums.txt 2>/dev/null || true
-            cat sha256sums.txt 2>/dev/null || true
+            # 产物是 sudo 下的打包脚本生成的，属主是 root，普通重定向会被拒绝
+            # （上一版就报过 "sha256sums.txt: Permission denied"），所以走 sudo tee
+            sha256sum *.img.gz | sudo tee sha256sums.txt > /dev/null
+            sudo chmod 644 sha256sums.txt
+            cat sha256sums.txt
             echo "---------------- 磁盘 -------------------"
             df -h / /opt || true
           else
