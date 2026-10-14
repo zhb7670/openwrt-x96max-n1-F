@@ -3,8 +3,14 @@
 V2 **不是重打一遍 V1**。它是在 V1 完全相同的打包流程上，**额外注入了一层定制 overlay**，
 把之前在这台设备上手工修好的 **DDNS-GO 两个问题**固化进固件，做到「刷完即用」。
 
-> **V1 与 V2 的原代码不混在一起**：V2 的全部定制内容只放在 `v2-inject/` 目录，
-> V1 构建时 `inject_dir` 留空、整步跳过，**永远不会读 `v2-inject/`**。
+> **V1 与 V2 的原代码不混在一起，而且是工作流级别的隔离**：
+> - V2 的定制内容只放在 **`v2-inject/`** 目录，且只被 **`build-v2.yml`** 引用；
+> - **`build-v1.yml` 里根本没有"注入"这一步**，也没有 `inject_dir` 这类参数，
+>   结构上就不可能读到 `v2-inject/`，也不存在"参数填错打成 V2"的可能；
+> - 两份工作流是独立的文件、独立的排队队列（`build-v1-*` / `build-v2-*`），
+>   改一份不会影响另一份。
+>
+> 默认 LAN IP 均为 **`192.168.100.1`**（用户 `root` / 密码 `password`）。
 
 ---
 
@@ -228,7 +234,8 @@ uci set ddns-go.config.enabled='1' && uci commit ddns-go && /etc/init.d/ddns-go 
 
 ### 三、注入是怎么合进固件的
 
-在 V1 的 5 步流程里，**第 3 步和第 4 步之间**插了一步（仅当 `inject_dir` 非空时执行）：
+在 V1 的 5 步流程里，**第 3 步和第 4 步之间**插了一步。
+这一步**只写在 `build-v2.yml` 里**，`build-v1.yml` 中不存在：
 
 ```
 ① 初始化环境  ② 建扩展盘  ③ 下载官方 rootfs
@@ -268,7 +275,8 @@ cd /builder/inject-work && sudo tar -cpf - . | pigz -9 > opt/download/openwrt-ar
 | LuCI 缓存 | — | 首启自动清空双层缓存 |
 | 内核 / 机型 / 文件名 | 6.12.112 · 6.18.56；N1 · X96Max+ | **完全相同** |
 | 原代码位置 | 仓库根（ophub 原件） | 根 + **`v2-inject/`（V2 专属）** |
-| 触发参数 | `inject_dir=` 留空 | `inject_dir=v2-inject` |
+| 工作流文件 | `build-v1.yml`（**没有注入步骤**） | `build-v2.yml`（含注入步骤） |
+| 排队队列 | `build-v1-*` | `build-v2-*`（两边互不干扰） |
 
 **V2 的固件文件名与 V1 完全一致**（因为内核、机型、`OPENWRT_VER` 都没变），
 所以两个版本分属两个 Release tag：**V1** 和 **V2**。
@@ -293,14 +301,15 @@ netstat -lntp | grep 9876             # 期望看到 0.0.0.0:9876 LISTEN
 ls /etc/uci-defaults/99-ddns-go-fix   # 期望：No such file or directory
 ```
 
-然后浏览器打开 `http://<路由IP>` → **服务 → DDNS-GO**，菜单应正常出现，
+然后浏览器打开 `http://192.168.100.1` → **服务 → DDNS-GO**，菜单应正常出现，
 点进去就是 ddns-go 的配置页。
 
 ---
 
 ### 六、不需要 DDNS-GO 修复？
 
-那就直接用 **V1**（纯官方）。或者在触发构建时把 `inject_dir` 留空，产出的就是 V1 行为。
+那就直接用 **V1**（纯官方）——跑 `build-v1.yml` 就行，**那份工作流里没有注入步骤**，
+不存在"误打成 V2"的可能。
 V1 与 V2 可以长期并存，互不影响。
 
 ---
