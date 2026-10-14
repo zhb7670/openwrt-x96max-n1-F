@@ -1,0 +1,249 @@
+#==========================================================================
+#  N1 (S905D) / X96Max+ (S905X3) OpenWrt 固件打包
+#
+#  流程完全遵循 ophub/flippy-openwrt-actions 的标准做法（不自己编译 OpenWrt）：
+#    ① 从 ophub/flippy-openwrt-actions 的 Release 下载现成的 armsr/armv8 rootfs
+#    ② 由本仓库根目录的 openwrt_flippy.sh（取自 ophub，GPL-2.0）调用
+#       unifreq/openwrt_packit 的 mk_s905d_n1.sh / mk_s905x3_multi.sh 打包
+#    ③ pigz 压缩成 .img.gz，上传到本仓库 Release
+#
+#  产出 4 个：
+#    openwrt_s905d_n1_R26.03.25_k6.12.112-flippy-95+o.img.gz
+#    openwrt_s905d_n1_R26.03.25_k6.18.56-flippy-95+.img.gz
+#    openwrt_s905x3_multi_R26.03.25_k6.12.112-flippy-95+o.img.gz
+#    openwrt_s905x3_multi_R26.03.25_k6.18.56-flippy-95+.img.gz
+#
+#  ★ 这三个片段是怎么来的（全自动，无需人工干预）
+#    - R26.03.25      : unifreq/openwrt_packit/make.env 里 OPENWRT_VER 的硬编码值。
+#                       openwrt_flippy.sh 在 OPENWRT_VER=auto 时会去读它。
+#    - -flippy-95+o   : 内核包自带。ophub/kernel 的 6.12.x 里 boot 文件叫
+#                       boot-6.12.112-flippy-95+o.tar.gz，脚本用
+#                       KERNEL_VERSION="${boot_kernel_file:5:-7}" 直接截出来。
+#                       6.18.56 对应的是 "-flippy-95+"（没有 o），同理。
+#    - 6.12.112/6.18.56: KERNEL_AUTO_LATEST=true 时脚本会抓
+#                       ophub/kernel 的 kernel_flippy release，
+#                       按正则 6.12.[0-9]+ / 6.18.[0-9]+ 排序取最新。
+#==========================================================================
+name: Build N1 / X96Max+ OpenWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_soc:
+        description: "打包机型（下划线分隔）：s905d=N1，s905x3=X96Max+"
+        required: true
+        default: "s905d_s905x3"
+      kernel_version:
+        description: "内核系列（下划线分隔，各自解析为同系列最新）"
+        required: true
+        default: "6.12.y_6.18.y"
+      auto_kernel:
+        description: "自动取同系列最新内核（6.12.y→6.12.112 / 6.18.y→6.18.56）"
+        required: true
+        default: true
+        type: boolean
+      openwrt_ip:
+        description: "固件默认 LAN IP"
+        required: true
+        default: "192.168.1.1"
+      rootfs_asset:
+        description: "rootfs 资产名（留空 = 自动取 ophub 最新的那个）"
+        required: false
+        default: "2026.02.20-openwrt-armsr-armv8-generic-rootfs.tar.gz"
+      release_tag:
+        description: "发布到哪个 Release tag"
+        required: true
+        default: "N1-X96MaxPlus"
+
+env:
+  TZ: Etc/UTC
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      #------------------------------------------------------------------
+      # 1. 环境准备
+      #------------------------------------------------------------------
+      - name: 初始化构建环境
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          sudo apt-get -y update
+          # ophub 官方依赖清单（原配 ubuntu-26.04 runner）。这里在 24.04 上使用，
+          # 并采用「先整批、失败再逐个」的策略，个别包名不匹配不影响整体。
+          DEPS="$(curl -fsSL https://ophub.org/ubuntu2604-make-openwrt-depends 2>/dev/null || true)"
+          if [ -z "${DEPS}" ]; then
+            DEPS="bc cpio device-tree-compiler dosfstools e2fsprogs fdisk file gawk \
+                  jq pigz qemu-utils rsync tar u-boot-tools unzip wget xfsprogs \
+                  xz-utils zip zstd"
+          fi
+          # 去掉 shell 通配符（如 gcc-arm*），否则 apt 会整批失败
+          DEPS="$(echo "${DEPS}" | tr ' ' '\n' | grep -v '\*' | tr '\n' ' ')"
+          echo ">>> 依赖包数量: $(echo ${DEPS} | wc -w)"
+          sudo apt-get -y install ${DEPS} && echo ">>> 整批安装成功" || {
+            echo ">>> 整批未通过，改为逐个安装（个别包缺失不影响）"
+            for p in ${DEPS}; do
+              sudo apt-get -y install "$p" >/dev/null 2>&1 || echo "    [skip] $p"
+            done
+          }
+          # mkfs.xfs 需要 xfsprogs，ophub 清单里没有，单独补
+          sudo apt-get -y install xfsprogs >/dev/null 2>&1 || echo "    [skip] xfsprogs"
+          echo ">>> 关键工具自检："
+          for c in fdisk sfdisk losetup mkfs.xfs mkimage dtc pigz gzip xz zstd jq curl git tar; do
+            printf "    %-10s : %s\n" "$c" "$(command -v $c 2>/dev/null || echo '缺失')"
+          done
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      #------------------------------------------------------------------
+      # 2. 扩展磁盘：新建 xfs 镜像挂到 /builder，再把 /opt 指过去
+      #    （openwrt_flippy.sh 默认拿 /opt 当工作目录，clone 打包脚本到
+      #      /opt/openwrt_packit，内核放到 /opt/kernel）
+      #------------------------------------------------------------------
+      - name: 创建扩展磁盘
+        id: disk
+        if: steps.init.outputs.status == 'success'
+        run: |
+          set -e
+          root_avail=$(df --block-size=1G / | awk 'NR==2 {print $4}')
+          root_size=$(( root_avail - 4 ))
+          [ "${root_size}" -gt 0 ] || { echo "空间不足: ${root_avail}G"; exit 1; }
+          echo ">>> / 可用 ${root_avail}G，创建 ${root_size}G 扩展镜像"
+          sudo truncate -s "${root_size}G" /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo ">>> 回环设备: ${build_dev}"
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          # runner 是一次性环境，/opt 里没有系统关键内容；用 mv 而非 rm，便于回溯
+          sudo mkdir -p /builder/opt
+          if [ -e /opt ] && [ ! -L /opt ]; then sudo mv /opt /opt.orig; fi
+          sudo ln -sfn /builder/opt /opt
+          sudo chown -R runner:runner /builder/opt
+          echo ">>> 挂载结果："
+          df -Th / /builder /opt
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      #------------------------------------------------------------------
+      # 3. 下载 rootfs（用 ophub 现成的，不自己编译）
+      #    openwrt_flippy.sh 只认文件名 openwrt-armsr-armv8-generic-rootfs.tar.gz
+      #------------------------------------------------------------------
+      - name: 下载 OpenWrt rootfs
+        id: download
+        if: steps.disk.outputs.status == 'success'
+        working-directory: /builder
+        run: |
+          set -e
+          mkdir -p opt/download
+          ln -sfn /builder/opt ${{ github.workspace }}/opt
+          ASSET="${{ inputs.rootfs_asset }}"
+          if [ -z "${ASSET}" ]; then
+            echo ">>> 未指定 rootfs，自动取 ophub 最新的一个"
+            ASSET="$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/ophub/flippy-openwrt-actions/releases?per_page=30" \
+              | jq -r '[.[] | select(.tag_name | contains("OpenWrt_armv8_rootfs"))]
+                       | map(.assets[] | select(.name | endswith("-rootfs.tar.gz")))
+                       | sort_by(.updated_at) | reverse | .[0].name')"
+          fi
+          echo ">>> 使用 rootfs: ${ASSET}"
+          curl -fL --retry 5 --retry-delay 10 \
+            -o opt/download/openwrt-armsr-armv8-generic-rootfs.tar.gz \
+            "https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_rootfs/${ASSET}"
+          ls -l --block-size=1 opt/download/
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      #------------------------------------------------------------------
+      # 4. 打包：直接调用本仓库根目录的 action（= ophub 的 openwrt_flippy.sh）
+      #    OPENWRT_ARMSR 是相对 $GITHUB_WORKSPACE 的路径，脚本内部会复制到
+      #    /opt/openwrt_packit/ 并改名为标准文件名
+      #------------------------------------------------------------------
+      - name: 打包固件
+        uses: ./
+        if: steps.download.outputs.status == 'success'
+        env:
+          OPENWRT_ARMSR: opt/download/*rootfs.tar.gz
+          PACKAGE_SOC: ${{ inputs.package_soc }}
+          KERNEL_REPO_URL: ophub/kernel
+          KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
+          KERNEL_AUTO_LATEST: ${{ inputs.auto_kernel }}
+          OPENWRT_IP: ${{ inputs.openwrt_ip }}
+          WHOAMI: flippy
+          GZIP_IMGS: gz
+          SAVE_OPENWRT_ROOTFS: "false"
+
+      #------------------------------------------------------------------
+      # 5. 列产物 / 算 sha256 / 上传
+      #------------------------------------------------------------------
+      - name: 列出产物并生成校验文件
+        if: always()
+        run: |
+          echo ">>> PACKAGED_STATUS     = ${{ env.PACKAGED_STATUS }}"
+          echo ">>> PACKAGED_OUTPUTPATH = ${{ env.PACKAGED_OUTPUTPATH }}"
+          if [ -n "${{ env.PACKAGED_OUTPUTPATH }}" ] && [ -d "${{ env.PACKAGED_OUTPUTPATH }}" ]; then
+            cd "${{ env.PACKAGED_OUTPUTPATH }}"
+            echo "---------------- 产物清单 ----------------"
+            ls -l --block-size=1
+            echo "---------------- sha256 ------------------"
+            sha256sum *.img.gz > sha256sums.txt 2>/dev/null || true
+            cat sha256sums.txt 2>/dev/null || true
+            echo "---------------- 磁盘 -------------------"
+            df -h / /opt || true
+          else
+            echo ">>> 没有产物目录，打包未成功"
+          fi
+
+      - name: 上传 Artifact
+        if: env.PACKAGED_STATUS == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-images
+          path: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 发布到 Release
+        if: env.PACKAGED_STATUS == 'success'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: ${{ inputs.release_tag }}
+          files: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          make_latest: true
+          body: |
+            ## OpenWrt 固件（Phicomm N1 / X96Max+）
+
+            由 [ophub/flippy-openwrt-actions](https://github.com/ophub/flippy-openwrt-actions)
+            标准流程打包（`unifreq/openwrt_packit` + `ophub/kernel`）。
+
+            | 机型 | 内核 | 文件 |
+            |---|---|---|
+            | Phicomm N1 (S905D) | 6.12.112 | `openwrt_s905d_n1_R26.03.25_k6.12.112-flippy-95+o.img.gz` |
+            | Phicomm N1 (S905D) | 6.18.56 | `openwrt_s905d_n1_R26.03.25_k6.18.56-flippy-95+.img.gz` |
+            | X96Max+ (S905X3) | 6.12.112 | `openwrt_s905x3_multi_R26.03.25_k6.12.112-flippy-95+o.img.gz` |
+            | X96Max+ (S905X3) | 6.18.56 | `openwrt_s905x3_multi_R26.03.25_k6.18.56-flippy-95+.img.gz` |
+
+            - 默认 IP：**192.168.1.1**
+            - 用户名 `root`　密码 `password`
+            - 默认 WIFI：`OpenWrt`　密码：无
+            - 写入 eMMC：登录 → 系统 → Amlogic Service → Install OpenWrt
+
+            校验下载完整性：
+
+            ```bash
+            sha256sum -c sha256sums.txt
+            ```

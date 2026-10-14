@@ -1,0 +1,20 @@
+name: "Package OpenWrt with Flippy's Script"
+author: "https://github.com/ophub/flippy-openwrt-actions"
+description: "Package OpenWrt firmware for Amlogic, Rockchip, and Allwinner devices."
+inputs:
+  mode:
+    description: "Select the packaging mode."
+    required: false
+    default: "flippy"
+
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        cd "${GITHUB_ACTION_PATH}"
+        ./openwrt_flippy.sh
+
+branding:
+  icon: "terminal"
+  color: "gray-dark"
