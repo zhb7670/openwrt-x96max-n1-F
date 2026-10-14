@@ -14,6 +14,33 @@ V2 **不是重打一遍 V1**。它是在 V1 完全相同的打包流程上，**�
 
 ---
 
+### 〇、本次构建的实际产出
+
+| 机型 | 内核 | 大小（字节） | sha256 |
+|---|---|---|---|
+| Phicomm N1（S905D） | 6.12.112 | 652,576,775 | `cfb61424…739dad` |
+| Phicomm N1（S905D） | 6.18.56 | 657,076,116 | `6d204b42…7ea2e7` |
+| X96Max+（S905X3） | 6.12.112 | 656,048,769 | `d7b89326…62d56d` |
+| X96Max+（S905X3） | 6.18.56 | 661,765,664 | `cb81eb4f…7ef0cf` |
+
+完整校验值见资产 `sha256sums.txt`，下载后校验：
+
+```bash
+sha256sum -c sha256sums.txt
+```
+
+- 构建记录：`build-v2.yml` 的 **[Run 38608648298](https://github.com/zhb7670/openwrt-x96max-n1-F/actions/runs/38608648298)**，全部 10 步 success
+- 注入后在归档里逐项确认通过：`OK ./usr/lib/lua/luci/controller/ddns-go.lua`、
+  `OK ./usr/lib/lua/luci/view/ddns-go/ddns-go.htm`、
+  `OK ./etc/uci-defaults/99-ddns-go-fix`（rootfs 条目数 20213）
+- 默认 LAN IP：**192.168.100.1**　用户 `root` / 密码 `password`
+
+> **与 V1 的体积差在 ±0.15% 以内，属 gzip 正常波动**，不是内容差异。
+> 原因是注入时把 rootfs 重新用 `pigz -9` 压了一遍，压缩率和官方原包略有出入。
+> 判断两版是不是同一份内容，请看 sha256，**不要看大小**。
+
+---
+
 ### 一、V2 到底优化了什么（逐条）
 
 #### 优化 1：DDNS-GO 的 LuCI 菜单从「完全没有」到「正常出现」
