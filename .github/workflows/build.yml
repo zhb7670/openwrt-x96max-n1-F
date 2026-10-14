@@ -214,9 +214,11 @@ jobs:
           echo "------------------------------------------"
           sudo cp -a "${SRC}/." "${WORK}/"
 
-          # uci-defaults 脚本必须可执行；git 检出后是小写 644
+          # uci-defaults 下的脚本一律给执行位。
+          # 不能依赖检出时的权限位：Windows 上 core.filemode=false，Git 记的
+          # 恒为 644，cp -a 过来的还是 644；OpenWrt 官方本来也都是 755。
           if [ -d "${WORK}/etc/uci-defaults" ]; then
-            sudo find "${WORK}/etc/uci-defaults" -maxdepth 1 -type f ! -perm -u+x \
+            sudo find "${WORK}/etc/uci-defaults" -maxdepth 1 -type f \
               -exec chmod 755 {} + 2>/dev/null || true
           fi
 
